@@ -39,9 +39,6 @@ def find_latest_prob_csv(directory: str):
                 latest_file = fname
     return latest_file
 
-def almost_equal(a, b, tol=1e-6):
-    return abs(a-b) <= tol
-
 def load_home(wp_path):
     with open(wp_path) as f:
         hdr = f.readline().strip()
@@ -108,10 +105,18 @@ margin = 0 #필터된 점들을 둘러싼 다각형을 buffer(margin) 으로 확
 concave_flag = False #Concave Hull 알고리즘에서 점 간선을 만들기 위한 거리 임계치(단위: 위·경도)입니다.
 alpha = 0.001
 min_area = 10 #다각형(폴리곤) 면적이 이 값 이하로 작아지면 “완료”로 간주하고 그리드 생성을 중단하는 기준 면적(㎡)입니다.
+OVERLAP_THRESHOLD = 0.9
+
+
 
 # Load home
 home_lat, home_lon, home_alt = load_home(old_wp)
 existing_coords = load_coords(old_wp)
+
+exist_poly = None
+if len(existing_coords) >= 3:
+    exist_poly = build_polygon(existing_coords, concave_flag, alpha)
+
 
 # Load and filter points
 df = pd.read_csv(csv_file)
@@ -122,6 +127,15 @@ poly_geo = build_polygon(pts, concave_flag, alpha)
 if margin:
     poly_geo = poly_geo.buffer(margin / 111000)
 
+if exist_poly is not None:
+    inter_area   = poly_geo.intersection(exist_poly).area
+    base_area    = poly_geo.area
+    overlap_ratio = inter_area / base_area if base_area > 0 else 0.0
+#    print(f"Polygon overlap: {overlap_ratio:.1%}")
+else:
+    overlap_ratio = 0.0
+
+
 # Project to ENU
 proj = Transformer.from_crs("epsg:4326", f"+proj=tmerc +lat_0={home_lat} +lon_0={home_lon}", always_xy=True)
 poly_xy = Polygon([proj.transform(lon, lat) for lon, lat in poly_geo.exterior.coords])
@@ -130,20 +144,11 @@ print(f"Area: {area_m2:.1f} m²")
 
 if min_area and area_m2 <= min_area:
     print("탐색 구간이 작아 작업을 종료합니다.")
+elif overlap_ratio >= OVERLAP_THRESHOLD:
+    print(f"탐색 구간이 이전 경로와 {overlap_ratio:.1%} 겹칩니다. 작업을 종료합니다.")
 else:
     # 그리드 생성 이후 비교
     grid_xy = lawnmower(poly_xy, spacing)
     inv = Transformer.from_crs(proj.target_crs, "epsg:4326", always_xy=True)
     grid_geo = [inv.transform(x, y)[::-1] for x, y in grid_xy]
-
-    # 1) 길이 일치 여부
-    # 2) 좌표별 tolerance 검사
-    if (len(grid_geo) == len(existing_coords)
-        and all(
-            almost_equal(g_lat, e_lat) and almost_equal(g_lon, e_lon)
-            for (g_lat, g_lon), (e_lat, e_lon)
-            in zip(grid_geo, existing_coords)
-        )):
-        print("경로가 이전과 동일합니다. 작업을 종료합니다.")
-    else:
-        save_wp(output_wp, (home_lat, home_lon), home_alt, grid_geo)
+    save_wp(output_wp, (home_lat, home_lon), home_alt, grid_geo)
