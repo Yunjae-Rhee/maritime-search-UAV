@@ -219,17 +219,21 @@ area_m2 = poly_xy.area
 print(f"Area: {area_m2:.1f} m²")
 
 if min_area and area_m2 <= min_area:
-    print("탐색 구간이 작아 작업을 종료합니다.")
+    print("탐색 구간이 작아 작업을 종료합니다.") 
+    sys.exit(99)  # ← 종료 신호
+
 elif overlap_ratio >= OVERLAP_THRESHOLD:
     print(f"탐색 구간이 이전 경로와 {overlap_ratio:.1%} 겹칩니다. 작업을 종료합니다.")
+    sys.exit(99)  # ← 종료 신호
+
 else:
     # 그리드 생성 이후 비교
     grid_xy = lawnmower(poly_xy, spacing)
     inv = Transformer.from_crs(proj.target_crs, "epsg:4326", always_xy=True)
     grid_geo = [inv.transform(x, y)[::-1] for x, y in grid_xy]
     if not grid_geo:
-        print("생성된 경로가 비어 있습니다. 종료.")
-        sys.exit(0)
+        print("생성된 경로가 비어 있습니다. 종료.") 
+        sys.exit(99)  # ← 종료 신호
     upload_points_pymavlink(
         grid_geo, alt_m=REL_ALT,
         conn_str='COM7',  # ← 여길 너 환경에 맞게
