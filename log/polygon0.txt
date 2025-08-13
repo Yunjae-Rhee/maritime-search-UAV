@@ -1,0 +1,1 @@
+Polygon exterior vertices (lon, lat):

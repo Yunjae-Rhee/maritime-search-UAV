@@ -6,6 +6,8 @@ from shapely.geometry import MultiPoint, Polygon, LineString
 from shapely.ops import polygonize, unary_union
 from pyproj import Transformer
 import os, re
+from dronekit import connect, Command
+from pymavlink import mavutil
 
 def find_latest_and_next_route_wp(directory: str):
 
@@ -18,11 +20,7 @@ def find_latest_and_next_route_wp(directory: str):
             n = int(m.group(1))
             if n > max_n:
                 max_n = n
-                latest_file = fname
-    # Determine next filename
-    next_index = max_n + 1 if max_n >= 0 else 0
-    next_file = f'route{next_index}.wp'
-    return latest_file, next_file
+    return max_n
 
 
 def find_latest_prob_csv(directory: str):
@@ -38,6 +36,7 @@ def find_latest_prob_csv(directory: str):
                 max_n = n
                 latest_file = fname
     return latest_file
+
 
 def load_home(wp_path):
     with open(wp_path) as f:
@@ -96,9 +95,84 @@ def lawnmower(poly_xy, spacing):
         flip = not flip
     return path
 
-# Example usage in notebook
-old_wp, output_wp = find_latest_and_next_route_wp(os.getcwd())
-csv_file = find_latest_prob_csv(os.getcwd())
+
+def load_polygon_from_txt(txt_path):
+    coords = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("Polygon exterior"):
+                continue  # 헤더 스킵
+            try:
+                lon, lat = map(float, line.split(","))
+                coords.append((lon, lat))
+            except ValueError:
+                continue  # 잘못된 줄은 무시
+    if len(coords) >= 3:
+        return Polygon(coords)
+    else:
+        return None  # 유효한 다각형 아님
+
+from pymavlink import mavutil
+
+def upload_points_pymavlink(points_latlon, alt_m, conn_str='COM7', baud=115200):
+    """
+    points_latlon: [(lat, lon), ...]  # 비행 경로 (라운드모어 등)
+    alt_m: 상대고도(m) — 이륙지점 기준 높이 (예: 50.0)
+    """
+    if not points_latlon:
+        print("[Mission] 업로드할 웨이포인트가 없습니다.")
+        return
+
+    m = mavutil.mavlink_connection(conn_str, baud=baud)
+    m.wait_heartbeat()
+    ts, tc = m.target_system, m.target_component
+    print(f"[Mission] Connected: sys={ts} comp={tc}")
+
+    # 기존 미션 삭제
+    m.mav.mission_clear_all_send(ts, tc)
+
+    total = len(points_latlon)
+    m.mav.mission_count_send(ts, tc, total)
+
+    sent = 0
+    while sent < total:
+        req = m.recv_match(type=['MISSION_REQUEST_INT','MISSION_REQUEST'], blocking=True, timeout=5)
+        if req is None:
+            raise TimeoutError("MISSION_REQUEST 타임아웃")
+
+        seq = req.seq
+        lat, lon = points_latlon[seq]
+
+        m.mav.mission_item_int_send(
+            ts, tc,
+            seq,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,  # 상대고도 프레임
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 1,  # current, autocontinue
+            0, 0, 0, 0,
+            int(lat * 1e7), int(lon * 1e7), float(alt_m)
+        )
+        sent += 1
+
+    ack = m.recv_match(type='MISSION_ACK', blocking=True, timeout=5)
+    if not ack:
+        raise TimeoutError("MISSION_ACK 없음")
+    print(f"[Mission] Upload ACK: {ack.type}  (waypoints={total})")
+
+#=======================================================================================================
+# log 디렉토리 경로
+log_dir = os.path.join(os.getcwd(), 'log')
+os.makedirs(log_dir, exist_ok=True)
+
+# 파일 경로 설정
+wp_index = find_latest_and_next_route_wp(log_dir)
+old_wp   = os.path.join(log_dir, f'route{wp_index}.wp')
+output_wp = os.path.join(log_dir, f'route{wp_index + 1}.wp')
+csv_file = os.path.join(log_dir, find_latest_prob_csv(log_dir))
+txt_old  = os.path.join(log_dir, f"polygon{wp_index}.txt")
+txt_out  = os.path.join(log_dir, f"polygon{wp_index + 1}.txt")
+
 p1, p2 = 0.3, 0.4
 spacing = 40 #Z-자(라운드모어) 그리드 경로의 격자 간격을 미터 단위로 지정합니다.
 margin = 0 #필터된 점들을 둘러싼 다각형을 buffer(margin) 으로 확장할 때 사용할 버퍼 폭(미터)입니다.
@@ -106,34 +180,36 @@ concave_flag = False #Concave Hull 알고리즘에서 점 간선을 만들기 �
 alpha = 0.001
 min_area = 10 #다각형(폴리곤) 면적이 이 값 이하로 작아지면 “완료”로 간주하고 그리드 생성을 중단하는 기준 면적(㎡)입니다.
 OVERLAP_THRESHOLD = 0.9
-
+REL_ALT = 10 # 상대고도(m) — 이륙지점 기준 높이 (예: 10.0)
 
 
 # Load home
 home_lat, home_lon, home_alt = load_home(old_wp)
-existing_coords = load_coords(old_wp)
 
-exist_poly = None
-if len(existing_coords) >= 3:
-    exist_poly = build_polygon(existing_coords, concave_flag, alpha)
-
+exist_poly = load_polygon_from_txt(txt_old)
 
 # Load and filter points
 df = pd.read_csv(csv_file)
 pts = df[(df.p_human >= p1) & (df.p_ship >= p2)][["lat", "lon"]].to_numpy()
+
+
 
 # Build polygon
 poly_geo = build_polygon(pts, concave_flag, alpha)
 if margin:
     poly_geo = poly_geo.buffer(margin / 111000)
 
+coords = list(poly_geo.exterior.coords)
+
+
 if exist_poly is not None:
     inter_area   = poly_geo.intersection(exist_poly).area
-    base_area    = poly_geo.area
+    base_area    = exist_poly.area
     overlap_ratio = inter_area / base_area if base_area > 0 else 0.0
 #    print(f"Polygon overlap: {overlap_ratio:.1%}")
 else:
     overlap_ratio = 0.0
+
 
 
 # Project to ENU
@@ -151,4 +227,17 @@ else:
     grid_xy = lawnmower(poly_xy, spacing)
     inv = Transformer.from_crs(proj.target_crs, "epsg:4326", always_xy=True)
     grid_geo = [inv.transform(x, y)[::-1] for x, y in grid_xy]
+    if not grid_geo:
+        print("생성된 경로가 비어 있습니다. 종료.")
+        sys.exit(0)
+    upload_points_pymavlink(
+        grid_geo, alt_m=REL_ALT,
+        conn_str='COM7',  # ← 여길 너 환경에 맞게
+        baud=115200
+    )
     save_wp(output_wp, (home_lat, home_lon), home_alt, grid_geo)
+    
+    with open(txt_out, "w", encoding="utf-8") as f:
+        f.write("Polygon exterior vertices (lon, lat):\n")
+        for lon, lat in coords:
+            f.write(f"{lon}, {lat}\n")

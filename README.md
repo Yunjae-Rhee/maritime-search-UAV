@@ -5,8 +5,8 @@
     : 처음에 Mission Planner로 만든 기준 경로(.csv)  
   - `identifier.py`  
     : 영상 & 학습 데이터 → 객체 탐지 → `prob{n}.csv` 생성  
-  - `remap.ipynb` (또는 `remap.py`)  
-    : `route{n}.wp` + `prob{n}.csv` → 새로운 경로 생성 → `route{n}.wp` 덮어쓰기  
+  - `route_update.py` 
+    : `route{n}.wp` + `prob{n}.csv` → 새로운 경로 생성 → 기체에 업데이트 & `route{n}.wp` 덮어쓰기  
   - `training_data/`  
     : 학습용 이미지·레이블 등 원본 데이터 저장소  
   - `visualize.py`  
