@@ -7,12 +7,8 @@ my-project/
 │  └─ 확률 데이터(`prob`) → 폴리곤/경로 생성, 드론 업로드, 로그 저장  
 ├─ **identifier.py**  
 │  └─ 영상 객체탐지 → `probN.csv` 생성  
-├─ **telemetry_stream.py**  
-│  └─ 드론 현재 위치를 `log/live_state.json`, `log/track.csv`로 기록  
 ├─ **visualize.py**  
 │  └─ 대시보드 표시 (현재 위치 + 폴리곤 + 경로 + 확률점 지도)  
-├─ **requirements.txt**  
-│  └─ (선택) 의존성 목록  
 └─ **log/**  
   ├─ **route0.wp**    # 초기 경로 (최소 1개 필요)  
   ├─ **prob1.csv**   # (예시) 확률 데이터  
