@@ -1,247 +1,227 @@
-import argparse
-import sys
+# route_update.py — prob → polygon → lawnmower path → route(N+1).wp 저장 (업로드 없음)
+import sys, os, re, argparse
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from shapely.geometry import MultiPoint, Polygon, LineString
 from shapely.ops import polygonize, unary_union
 from pyproj import Transformer
-import os, re
-from dronekit import connect, Command
-from pymavlink import mavutil
 
-def find_latest_and_next_route_wp(directory: str):
+LOG_DIR = Path.cwd() / "log"
 
-    max_n = -1
-    latest_file = None
-    # Iterate through directory
-    for fname in os.listdir(directory):
-        m = re.match(r'^route(\d+)\.wp$', fname)
+# ----------------- 유틸 -----------------
+def find_latest_index(pattern: str) -> int:
+    """pattern 예: r'^route(\d+)\.wp$'"""
+    mx = -1
+    for fname in os.listdir(LOG_DIR):
+        m = re.match(pattern, fname)
         if m:
-            n = int(m.group(1))
-            if n > max_n:
-                max_n = n
-    return max_n
+            mx = max(mx, int(m.group(1)))
+    return mx
 
-
-def find_latest_prob_csv(directory: str):
-
-    max_n = -1
-    latest_file = None
-    # Iterate through directory
-    for fname in os.listdir(directory):
+def find_latest_prob_csv() -> Path | None:
+    mx = -1; latest = None
+    for fname in os.listdir(LOG_DIR):
         m = re.match(r'^prob(\d+)\.csv$', fname)
         if m:
             n = int(m.group(1))
-            if n > max_n:
-                max_n = n
-                latest_file = fname
-    return latest_file
+            if n > mx:
+                mx = n; latest = fname
+    return (LOG_DIR / latest) if latest else None
 
-
-def load_home(wp_path):
-    with open(wp_path) as f:
+def load_home(wp_path: Path):
+    with open(wp_path, "r", encoding="utf-8") as f:
         hdr = f.readline().strip()
         if hdr != "QGC WPL 110":
             raise ValueError(".wp version must be QGC WPL 110")
-        lat, lon, alt = map(float, f.readline().split('\t')[8:11])
+        parts = f.readline().strip().split('\t')
+        lat, lon, alt = map(float, parts[8:11])
     return lat, lon, alt
 
-def load_coords(wp_path):
-    coords = []
-    with open(wp_path, "r") as f:
-        f.readline()  # header
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 11:
-                lat, lon = float(parts[8]), float(parts[9])
-                coords.append((lat, lon))
-    return coords[1:]
-
-def save_wp(out, home, alt, coords):
-    with open(out, "w") as f:
-        f.write("QGC WPL 110\n")
-        f.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{home[0]}\t{home[1]}\t{alt}\n")
-        for i, (lat, lon) in enumerate(coords, 1):
-            f.write(f"{i}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\n")
-    print(f"Saved '{out}' with {len(coords)} waypoints")
-
-def concave_hull(points, alpha):
-    edges = []
-    for i, p in enumerate(points):
-        for j, q in enumerate(points[i+1:], start=i+1):
-            if np.linalg.norm(p - q) < alpha:
-                edges.append([(p[1], p[0]), (q[1], q[0])])
-    mls = unary_union(edges)
-    polys = polygonize(mls)
-    return max(polys, key=lambda p: p.area)
-
-def build_polygon(pts, concave=False, alpha=0.001):
-    mp = MultiPoint([(lon, lat) for lat, lon in pts])
-    return concave_hull(pts, alpha) if concave else mp.convex_hull
-
-def lawnmower(poly_xy, spacing):
-    minx, miny, maxx, maxy = poly_xy.bounds
-    y, flip, path = miny, False, []
-    while y <= maxy:
-        seg = LineString([(minx, y), (maxx, y)]).intersection(poly_xy)
-        if not seg.is_empty:
-            if hasattr(seg, 'geoms'):
-                seg = max(seg, key=lambda s: s.length)
-            coords = list(seg.coords)
-            if flip:
-                coords.reverse()
-            path.extend(coords)
-        y += spacing
-        flip = not flip
-    return path
-
-
-def load_polygon_from_txt(txt_path):
+def load_existing_polygon(txt_path: Path) -> Polygon | None:
+    if not txt_path.exists():
+        return None
     coords = []
     with open(txt_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("Polygon exterior"):
-                continue  # 헤더 스킵
+            if (not line) or line.startswith("Polygon exterior"):
+                continue
             try:
                 lon, lat = map(float, line.split(","))
                 coords.append((lon, lat))
-            except ValueError:
-                continue  # 잘못된 줄은 무시
+            except Exception:
+                continue
     if len(coords) >= 3:
         return Polygon(coords)
-    else:
-        return None  # 유효한 다각형 아님
+    return None
 
-from pymavlink import mavutil
-
-def upload_points_pymavlink(points_latlon, alt_m, conn_str='COM7', baud=115200):
-    """
-    points_latlon: [(lat, lon), ...]  # 비행 경로 (라운드모어 등)
-    alt_m: 상대고도(m) — 이륙지점 기준 높이 (예: 50.0)
-    """
-    if not points_latlon:
-        print("[Mission] 업로드할 웨이포인트가 없습니다.")
-        return
-
-    m = mavutil.mavlink_connection(conn_str, baud=baud)
-    m.wait_heartbeat()
-    ts, tc = m.target_system, m.target_component
-    print(f"[Mission] Connected: sys={ts} comp={tc}")
-
-    # 기존 미션 삭제
-    m.mav.mission_clear_all_send(ts, tc)
-
-    total = len(points_latlon)
-    m.mav.mission_count_send(ts, tc, total)
-
-    sent = 0
-    while sent < total:
-        req = m.recv_match(type=['MISSION_REQUEST_INT','MISSION_REQUEST'], blocking=True, timeout=5)
-        if req is None:
-            raise TimeoutError("MISSION_REQUEST 타임아웃")
-
-        seq = req.seq
-        lat, lon = points_latlon[seq]
-
-        m.mav.mission_item_int_send(
-            ts, tc,
-            seq,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,  # 상대고도 프레임
-            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            0, 1,  # current, autocontinue
-            0, 0, 0, 0,
-            int(lat * 1e7), int(lon * 1e7), float(alt_m)
-        )
-        sent += 1
-
-    ack = m.recv_match(type='MISSION_ACK', blocking=True, timeout=5)
-    if not ack:
-        raise TimeoutError("MISSION_ACK 없음")
-    print(f"[Mission] Upload ACK: {ack.type}  (waypoints={total})")
-
-#=======================================================================================================
-# log 디렉토리 경로
-log_dir = os.path.join(os.getcwd(), 'log')
-os.makedirs(log_dir, exist_ok=True)
-
-# 파일 경로 설정
-wp_index = find_latest_and_next_route_wp(log_dir)
-old_wp   = os.path.join(log_dir, f'route{wp_index}.wp')
-output_wp = os.path.join(log_dir, f'route{wp_index + 1}.wp')
-csv_file = os.path.join(log_dir, find_latest_prob_csv(log_dir))
-txt_old  = os.path.join(log_dir, f"polygon{wp_index}.txt")
-txt_out  = os.path.join(log_dir, f"polygon{wp_index + 1}.txt")
-
-p1, p2 = 0.3, 0.4
-spacing = 40 #Z-자(라운드모어) 그리드 경로의 격자 간격을 미터 단위로 지정합니다.
-margin = 0 #필터된 점들을 둘러싼 다각형을 buffer(margin) 으로 확장할 때 사용할 버퍼 폭(미터)입니다.
-concave_flag = False #Concave Hull 알고리즘에서 점 간선을 만들기 위한 거리 임계치(단위: 위·경도)입니다.
-alpha = 0.001
-min_area = 10 #다각형(폴리곤) 면적이 이 값 이하로 작아지면 “완료”로 간주하고 그리드 생성을 중단하는 기준 면적(㎡)입니다.
-OVERLAP_THRESHOLD = 0.9
-REL_ALT = 10 # 상대고도(m) — 이륙지점 기준 높이 (예: 10.0)
-
-
-# Load home
-home_lat, home_lon, home_alt = load_home(old_wp)
-
-exist_poly = load_polygon_from_txt(txt_old)
-
-# Load and filter points
-df = pd.read_csv(csv_file)
-pts = df[(df.p_human >= p1) & (df.p_ship >= p2)][["lat", "lon"]].to_numpy()
-
-
-
-# Build polygon
-poly_geo = build_polygon(pts, concave_flag, alpha)
-if margin:
-    poly_geo = poly_geo.buffer(margin / 111000)
-
-coords = list(poly_geo.exterior.coords)
-
-
-if exist_poly is not None:
-    inter_area   = poly_geo.intersection(exist_poly).area
-    base_area    = exist_poly.area
-    overlap_ratio = inter_area / base_area if base_area > 0 else 0.0
-#    print(f"Polygon overlap: {overlap_ratio:.1%}")
-else:
-    overlap_ratio = 0.0
-
-
-
-# Project to ENU
-proj = Transformer.from_crs("epsg:4326", f"+proj=tmerc +lat_0={home_lat} +lon_0={home_lon}", always_xy=True)
-poly_xy = Polygon([proj.transform(lon, lat) for lon, lat in poly_geo.exterior.coords])
-area_m2 = poly_xy.area
-print(f"Area: {area_m2:.1f} m²")
-
-if min_area and area_m2 <= min_area:
-    print("탐색 구간이 작아 작업을 종료합니다.") 
-    sys.exit(99)  # ← 종료 신호
-
-elif overlap_ratio >= OVERLAP_THRESHOLD:
-    print(f"탐색 구간이 이전 경로와 {overlap_ratio:.1%} 겹칩니다. 작업을 종료합니다.")
-    sys.exit(99)  # ← 종료 신호
-
-else:
-    # 그리드 생성 이후 비교
-    grid_xy = lawnmower(poly_xy, spacing)
-    inv = Transformer.from_crs(proj.target_crs, "epsg:4326", always_xy=True)
-    grid_geo = [inv.transform(x, y)[::-1] for x, y in grid_xy]
-    if not grid_geo:
-        print("생성된 경로가 비어 있습니다. 종료.") 
-        sys.exit(99)  # ← 종료 신호
-    upload_points_pymavlink(
-        grid_geo, alt_m=REL_ALT,
-        conn_str='COM7',  # ← 여길 너 환경에 맞게
-        baud=115200
-    )
-    save_wp(output_wp, (home_lat, home_lon), home_alt, grid_geo)
-    
-    with open(txt_out, "w", encoding="utf-8") as f:
+def save_polygon_txt(path: Path, poly: Polygon):
+    with open(path, "w", encoding="utf-8") as f:
         f.write("Polygon exterior vertices (lon, lat):\n")
-        for lon, lat in coords:
+        for lon, lat in poly.exterior.coords:
             f.write(f"{lon}, {lat}\n")
+
+def save_wp(out_path: Path, home_lat: float, home_lon: float, rel_alt: float, coords_latlon: list[tuple[float,float]]):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("QGC WPL 110\n")
+        # 홈 행 (frame=0, cmd=16은 관례적으로 두지만 실제 사용은 웨이포인트들)
+        f.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{home_lat}\t{home_lon}\t{rel_alt}\t1\n")
+        # 웨이포인트 (MAV_FRAME_GLOBAL_RELATIVE_ALT = 3, MAV_CMD_NAV_WAYPOINT = 16)
+        for i, (lat, lon) in enumerate(coords_latlon, start=1):
+            f.write(f"{i}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{rel_alt}\t1\n")
+
+# ----------------- 기하 -----------------
+def concave_hull(points_ll, alpha_ll):
+    """아주 단순한 concave 근사(거리 임계로 간선 구성). points_ll: [[lat,lon], ...]"""
+    pts = np.asarray(points_ll, dtype=float)
+    edges = []
+    for i, p in enumerate(pts):
+        for q in pts[i+1:]:
+            if np.linalg.norm(p - q) < alpha_ll:
+                # shapely polygonize는 (x,y)=(lon,lat) 순서를 기대
+                edges.append([(p[1], p[0]), (q[1], q[0])])
+    if not edges:
+        # fallback: convex hull
+        mp = MultiPoint([(lon, lat) for lat, lon in pts])
+        return mp.convex_hull
+    mls = unary_union(edges)
+    polys = list(polygonize(mls))
+    if not polys:
+        mp = MultiPoint([(lon, lat) for lat, lon in pts])
+        return mp.convex_hull
+    return max(polys, key=lambda p: p.area)
+
+def build_polygon(points_latlon: np.ndarray, concave=False, alpha=0.001) -> Polygon:
+    """points_latlon: Nx2 with columns [lat, lon]"""
+    if len(points_latlon) < 3:
+        return None
+    if concave:
+        return concave_hull(points_latlon, alpha)
+    # convex
+    mp = MultiPoint([(lon, lat) for lat, lon in points_latlon])
+    return mp.convex_hull
+
+def lawnmower(poly_xy: Polygon, spacing_m: float) -> list[tuple[float,float]]:
+    """poly_xy: 로컬 좌표계(미터) 폴리곤, 반환: [(x,y), ...]"""
+    minx, miny, maxx, maxy = poly_xy.bounds
+    y = miny
+    flip = False
+    path_xy = []
+    while y <= maxy:
+        seg = LineString([(minx, y), (maxx, y)]).intersection(poly_xy)
+        if not seg.is_empty:
+            if hasattr(seg, "geoms"):
+                seg = max(seg, key=lambda s: s.length)
+            coords = list(seg.coords)
+            if flip: coords.reverse()
+            path_xy.extend(coords)
+        y += spacing_m
+        flip = not flip
+    return path_xy
+
+# ----------------- 메인 로직 -----------------
+def main():
+    ap = argparse.ArgumentParser(description="prob → polygon → grid path → route(N+1).wp")
+    ap.add_argument("--p-human", type=float, default=0.3, help="p_human 임계값")
+    ap.add_argument("--p-ship",  type=float, default=0.4, help="p_ship 임계값")
+    ap.add_argument("--spacing", type=float, default=40.0, help="라운드모어 간격(m)")
+    ap.add_argument("--margin",  type=float, default=0.0, help="폴리곤 외곽 버퍼(m)")
+    ap.add_argument("--concave", action="store_true", help="concave hull 사용")
+    ap.add_argument("--alpha",   type=float, default=0.001, help="concave 간선 임계(위경도)")
+    ap.add_argument("--min-area", type=float, default=10.0, help="최소 탐색 면적(m^2)")
+    ap.add_argument("--overlap-th", type=float, default=0.9, help="겹침 비율 임계 (이전 폴리곤 대비)")
+    ap.add_argument("--rel-alt", type=float, default=10.0, help="웨이포인트 상대고도(m)")
+    ap.add_argument("--no-upload", action="store_true", default=True,
+                    help="계산/파일저장만 하고 업로드는 하지 않음(단일 연결 구조 권장)")
+    args = ap.parse_args()
+
+    LOG_DIR.mkdir(exist_ok=True)
+
+    # 최신 인덱스/파일
+    idx_route = find_latest_index(r'^route(\d+)\.wp$')
+    if idx_route < 0:
+        print("[route_update] log/에 route*.wp가 없습니다. (route0.wp 필요)", file=sys.stderr)
+        sys.exit(1)
+
+    old_wp   = LOG_DIR / f"route{idx_route}.wp"
+    txt_old  = LOG_DIR / f"polygon{idx_route}.txt"
+    csv_prob = find_latest_prob_csv()
+    if not csv_prob:
+        print("[route_update] prob*.csv가 없습니다.", file=sys.stderr)
+        sys.exit(1)
+
+    # 출력 경로
+    out_wp  = LOG_DIR / f"route{idx_route + 1}.wp"
+    out_txt = LOG_DIR / f"polygon{idx_route + 1}.txt"
+
+    # 홈 로드
+    home_lat, home_lon, _home_alt = load_home(old_wp)
+
+    # 이전 폴리곤(있으면)
+    exist_poly_geo = load_existing_polygon(txt_old)
+
+    # 확률 파일 로드 및 필터
+    df = pd.read_csv(csv_prob)
+    if not {"lat","lon","p_human","p_ship"}.issubset(df.columns):
+        print("[route_update] prob csv에 필요한 컬럼(lat,lon,p_human,p_ship)이 없습니다.", file=sys.stderr)
+        sys.exit(2)
+
+    pts = df[(df.p_human >= args.p_human) & (df.p_ship >= args.p_ship)][["lat","lon"]].to_numpy()
+    if len(pts) < 3:
+        print(f"[route_update] 필터 통과 점이 3개 미만({len(pts)}). 업데이트 없음.")
+        sys.exit(99)
+
+    # 폴리곤 생성 (+ margin)
+    poly_geo = build_polygon(pts, concave=args.concave, alpha=args.alpha)
+    if poly_geo is None or poly_geo.is_empty:
+        print("[route_update] 폴리곤 생성 실패. 업데이트 없음.")
+        sys.exit(99)
+    if args.margin > 0:
+        # 대략 1도 ≈ 111km 가정으로 버퍼(m→deg) 근사
+        poly_geo = poly_geo.buffer(args.margin / 111_000.0)
+
+    # 겹침 비율 계산 (이전 폴리곤 면적 대비)
+    if exist_poly_geo is not None and not exist_poly_geo.is_empty:
+        inter_area_deg2 = poly_geo.intersection(exist_poly_geo).area
+        base_area_deg2  = exist_poly_geo.area
+        overlap_ratio = (inter_area_deg2 / base_area_deg2) if base_area_deg2 > 0 else 0.0
+    else:
+        overlap_ratio = 0.0
+
+    # 로컬 투영 (Tmerc 중심=home)으로 면적/경로 생성
+    proj = Transformer.from_crs("epsg:4326",
+                                f"+proj=tmerc +lat_0={home_lat} +lon_0={home_lon}",
+                                always_xy=True)
+    poly_xy = Polygon([proj.transform(lon, lat) for lon, lat in poly_geo.exterior.coords])
+    area_m2 = poly_xy.area
+
+    print(f"[route_update] 영역 면적: {area_m2:.1f} m^2, 겹침: {overlap_ratio:.1%}")
+
+    # 종료 조건
+    if args.min_area and area_m2 <= args.min_area:
+        print("[route_update] 탐색 구간이 너무 작음 → 업데이트 없음")
+        sys.exit(99)
+    if overlap_ratio >= args.overlap_th:
+        print("[route_update] 이전 구역과 겹침 과다 → 업데이트 없음")
+        sys.exit(99)
+
+    # 라운드모어 경로(로컬) → 위경도로 역변환
+    grid_xy = lawnmower(poly_xy, spacing_m=args.spacing)
+    if not grid_xy:
+        print("[route_update] 라운드모어 경로 생성 실패 → 업데이트 없음")
+        sys.exit(99)
+
+    inv = Transformer.from_crs(proj.target_crs, "epsg:4326", always_xy=True)
+    grid_geo_latlon = [(inv.transform(x, y)[1], inv.transform(x, y)[0]) for (x, y) in grid_xy]  # (lat,lon)
+
+    # 저장
+    save_wp(out_wp, home_lat, home_lon, args.rel_alt, grid_geo_latlon)
+    save_polygon_txt(out_txt, poly_geo)
+
+    print(f"[route_update] 저장 완료: {out_wp.name} (WPs={len(grid_geo_latlon)}), {out_txt.name}")
+    # 업로드는 단일 연결(run_mission)이 담당하므로 여기서는 끝.
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
