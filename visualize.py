@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # --- 상단 경로 고정 (visualize.py가 "코드" 폴더에 있을 때) ---
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent     # 프로젝트 루트
-LOG  = ROOT / "log 2"                               # 항상 루트/log 를 바라봄
+LOG  = ROOT / "log"                               # 기본 로그 디렉토리 사용
 # 만약 log_sample을 쓰고 있다면: LOG = ROOT / "log_sample"
 
 print("[BOOT] ROOT =", ROOT)

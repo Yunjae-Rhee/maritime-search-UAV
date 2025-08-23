@@ -11,7 +11,7 @@ LOG_DIR = Path.cwd() / "log"
 
 # ----------------- 유틸 -----------------
 def find_latest_index(pattern: str) -> int:
-    """pattern 예: r'^route(\d+)\.wp$'"""
+    """pattern 예: r'^route(\\d+)\\.wp$'""" # r'^route(\d+)\.wp$' 정규식 수정
     mx = -1
     for fname in os.listdir(LOG_DIR):
         m = re.match(pattern, fname)
